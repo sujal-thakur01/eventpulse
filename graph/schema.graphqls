@@ -31,7 +31,6 @@ type PageInfo {
 type TransactionConnection {
   edges: [TransactionEdge!]!
   pageInfo: PageInfo!
-  totalCount: Int!
 }
 
 type Query {

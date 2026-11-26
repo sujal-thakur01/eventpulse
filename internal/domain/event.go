@@ -2,7 +2,10 @@ package domain
 
 import (
 	"fmt"
+	"strings"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 const (
@@ -22,6 +25,24 @@ type TransactionEvent struct {
 	EventType      string    `json:"event_type"`
 	AmountCents    int64     `json:"amount_cents"`
 	OccurredAt     time.Time `json:"occurred_at"`
+}
+
+// Validate checks that required fields are present and well-formed,
+// including that IdempotencyKey is a valid UUID.
+func (e TransactionEvent) Validate() error {
+	if _, err := uuid.Parse(e.IdempotencyKey); err != nil {
+		return fmt.Errorf("invalid idempotency_key UUID: %w", err)
+	}
+	if strings.TrimSpace(e.CustomerID) == "" {
+		return fmt.Errorf("customer_id is required")
+	}
+	if _, err := CalculatePoints(e.EventType, e.AmountCents); err != nil {
+		return err
+	}
+	if e.OccurredAt.IsZero() {
+		return fmt.Errorf("occurred_at is required")
+	}
+	return nil
 }
 
 // CalculatePoints computes reward points from event type and amount in cents.
