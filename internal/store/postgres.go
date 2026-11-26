@@ -12,8 +12,8 @@ import (
 )
 
 const (
-	pgCheckViolationCode            = "23514"
-	balanceCheckConstraintName      = "customer_balances_balance_check"
+	pgCheckViolationCode       = "23514"
+	balanceCheckConstraintName = "customer_balances_balance_check"
 )
 
 // PostgresStore wraps a pgxpool.Pool for database operations.

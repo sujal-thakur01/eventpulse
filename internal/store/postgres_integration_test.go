@@ -276,6 +276,7 @@ func TestProcessTransactionIntegration(t *testing.T) {
 		processed, err := st.ProcessTransaction(ctx, ev)
 		require.False(t, processed)
 		require.Error(t, err)
+		require.NotErrorIs(t, err, domain.ErrInsufficientBalance)
 
 		evCount, balCount, ledCount := countCustomerRows(t, ctx, st, customerID)
 		require.Equal(t, 0, evCount, "processed_events must be empty on rollback")
