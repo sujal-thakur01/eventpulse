@@ -1,8 +1,9 @@
 scalar Time
+scalar Int64
 
 type CustomerBalance {
   customerId: ID!
-  balance: Int!
+  balance: Int64!
   updatedAt: Time!
 }
 
@@ -11,8 +12,9 @@ type Transaction {
   idempotencyKey: String!
   customerId: ID!
   eventType: String!
-  amountCents: Int!
-  points: Int!
+  amountCents: Int64!
+  points: Int64!
+  occurredAt: Time!
   createdAt: Time!
 }
 
@@ -34,5 +36,6 @@ type TransactionConnection {
 
 type Query {
   customerBalance(customerId: ID!): CustomerBalance
+  # first is capped at 100 server-side.
   transactionHistory(customerId: ID!, first: Int, after: String): TransactionConnection!
 }
