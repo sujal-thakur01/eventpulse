@@ -1,0 +1,38 @@
+scalar Time
+
+type CustomerBalance {
+  customerId: ID!
+  balance: Int!
+  updatedAt: Time!
+}
+
+type Transaction {
+  id: ID!
+  idempotencyKey: String!
+  customerId: ID!
+  eventType: String!
+  amountCents: Int!
+  points: Int!
+  createdAt: Time!
+}
+
+type TransactionEdge {
+  cursor: String!
+  node: Transaction!
+}
+
+type PageInfo {
+  hasNextPage: Boolean!
+  endCursor: String
+}
+
+type TransactionConnection {
+  edges: [TransactionEdge!]!
+  pageInfo: PageInfo!
+  totalCount: Int!
+}
+
+type Query {
+  customerBalance(customerId: ID!): CustomerBalance
+  transactionHistory(customerId: ID!, first: Int, after: String): TransactionConnection!
+}
