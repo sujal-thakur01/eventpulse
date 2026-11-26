@@ -11,7 +11,10 @@ import (
 	"github.com/sujal-thakur01/eventpulse/migrations"
 )
 
-const pgCheckViolationCode = "23514"
+const (
+	pgCheckViolationCode            = "23514"
+	balanceCheckConstraintName      = "customer_balances_balance_check"
+)
 
 // PostgresStore wraps a pgxpool.Pool for database operations.
 type PostgresStore struct {
@@ -102,7 +105,9 @@ func (s *PostgresStore) ProcessTransaction(ctx context.Context, ev domain.Transa
 
 func classifyStoreError(op string, err error) error {
 	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && pgErr.Code == pgCheckViolationCode {
+	if errors.As(err, &pgErr) &&
+		pgErr.Code == pgCheckViolationCode &&
+		pgErr.ConstraintName == balanceCheckConstraintName {
 		return fmt.Errorf("%s: %w: %w", op, domain.ErrInsufficientBalance, pgErr)
 	}
 	return fmt.Errorf("%s: %w", op, err)

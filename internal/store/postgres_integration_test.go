@@ -54,6 +54,36 @@ func countCustomerRows(t *testing.T, ctx context.Context, st *PostgresStore, cus
 	return eventsCount, balanceCount, ledgerCount
 }
 
+// installLedgerFailTrigger creates a test-only trigger that raises an exception
+// when an insert into reward_ledger targets customer_id 'cust-ledger-fail'.
+func installLedgerFailTrigger(t *testing.T, ctx context.Context, st *PostgresStore) {
+	t.Helper()
+	_, err := st.pool.Exec(ctx, `
+		CREATE OR REPLACE FUNCTION raise_on_ledger_fail_customer()
+		RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN
+			IF NEW.customer_id = 'cust-ledger-fail' THEN
+				RAISE EXCEPTION 'simulated ledger failure for cust-ledger-fail';
+			END IF;
+			RETURN NEW;
+		END;
+		$$;
+
+		DROP TRIGGER IF EXISTS trig_ledger_fail ON reward_ledger;
+		CREATE TRIGGER trig_ledger_fail
+			BEFORE INSERT ON reward_ledger
+			FOR EACH ROW
+			EXECUTE FUNCTION raise_on_ledger_fail_customer();
+	`)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = st.pool.Exec(context.Background(), `
+			DROP TRIGGER IF EXISTS trig_ledger_fail ON reward_ledger;
+			DROP FUNCTION IF EXISTS raise_on_ledger_fail_customer();
+		`)
+	})
+}
+
 func TestProcessTransactionIntegration(t *testing.T) {
 	st := startIntegrationStore(t)
 	now := time.Date(2026, 11, 27, 1, 0, 0, 0, time.UTC)
@@ -204,6 +234,7 @@ func TestProcessTransactionIntegration(t *testing.T) {
 							var pgErr *pgconn.PgError
 							require.ErrorAs(t, err, &pgErr)
 							require.Equal(t, "23514", pgErr.Code)
+							require.Equal(t, balanceCheckConstraintName, pgErr.ConstraintName)
 						}
 					} else {
 						require.NoError(t, err, "step %d unexpected error", i)
@@ -223,6 +254,33 @@ func TestProcessTransactionIntegration(t *testing.T) {
 				}
 			})
 		}
+	})
+
+	// Guarantee 3: reward balance and ledger entry updated in one transaction.
+	// A test-only trigger simulates a ledger insert failure mid-transaction; the
+	// balance upsert (which runs before the ledger insert) must also be rolled back.
+	t.Run("guarantee3_ledger_failure_rolls_back_balance_and_event", func(t *testing.T) {
+		ctx := context.Background()
+		customerID := "cust-ledger-fail"
+
+		installLedgerFailTrigger(t, ctx, st)
+
+		ev := domain.TransactionEvent{
+			IdempotencyKey: uuid.NewString(),
+			CustomerID:     customerID,
+			EventType:      domain.EventTypePurchase,
+			AmountCents:    3000,
+			OccurredAt:     now,
+		}
+
+		processed, err := st.ProcessTransaction(ctx, ev)
+		require.False(t, processed)
+		require.Error(t, err)
+
+		evCount, balCount, ledCount := countCustomerRows(t, ctx, st, customerID)
+		require.Equal(t, 0, evCount, "processed_events must be empty on rollback")
+		require.Equal(t, 0, balCount, "customer_balances must be empty on rollback")
+		require.Equal(t, 0, ledCount, "reward_ledger must be empty on rollback")
 	})
 
 	t.Run("20_goroutines_one_customer", func(t *testing.T) {
