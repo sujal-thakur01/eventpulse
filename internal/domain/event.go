@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -17,6 +18,13 @@ const (
 	MaxPageSize = 100
 )
 
+var (
+	// ErrInvalidEvent indicates a malformed or domain-invalid transaction event.
+	ErrInvalidEvent = errors.New("invalid event")
+	// ErrInsufficientBalance indicates a reward deduction would make a customer's balance negative.
+	ErrInsufficientBalance = errors.New("insufficient balance")
+)
+
 // TransactionEvent represents an incoming customer transaction event.
 // Points are calculated server-side from EventType and AmountCents.
 type TransactionEvent struct {
@@ -31,16 +39,16 @@ type TransactionEvent struct {
 // including that IdempotencyKey is a valid UUID.
 func (e TransactionEvent) Validate() error {
 	if _, err := uuid.Parse(e.IdempotencyKey); err != nil {
-		return fmt.Errorf("invalid idempotency_key UUID: %w", err)
+		return fmt.Errorf("%w: invalid idempotency_key UUID: %v", ErrInvalidEvent, err)
 	}
 	if strings.TrimSpace(e.CustomerID) == "" {
-		return fmt.Errorf("customer_id is required")
+		return fmt.Errorf("%w: customer_id is required", ErrInvalidEvent)
 	}
 	if _, err := CalculatePoints(e.EventType, e.AmountCents); err != nil {
 		return err
 	}
 	if e.OccurredAt.IsZero() {
-		return fmt.Errorf("occurred_at is required")
+		return fmt.Errorf("%w: occurred_at is required", ErrInvalidEvent)
 	}
 	return nil
 }
@@ -48,7 +56,7 @@ func (e TransactionEvent) Validate() error {
 // CalculatePoints computes reward points from event type and amount in cents.
 func CalculatePoints(eventType string, amountCents int64) (int64, error) {
 	if amountCents <= 0 {
-		return 0, fmt.Errorf("amount_cents must be positive, got %d", amountCents)
+		return 0, fmt.Errorf("%w: amount_cents must be positive, got %d", ErrInvalidEvent, amountCents)
 	}
 	switch eventType {
 	case EventTypePurchase, EventTypeBonus:
@@ -56,7 +64,7 @@ func CalculatePoints(eventType string, amountCents int64) (int64, error) {
 	case EventTypeRefund:
 		return -(amountCents / 100), nil
 	default:
-		return 0, fmt.Errorf("unsupported event_type %q", eventType)
+		return 0, fmt.Errorf("%w: unsupported event_type %q", ErrInvalidEvent, eventType)
 	}
 }
 

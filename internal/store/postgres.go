@@ -2,12 +2,16 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/sujal-thakur01/eventpulse/internal/domain"
 	"github.com/sujal-thakur01/eventpulse/migrations"
 )
+
+const pgCheckViolationCode = "23514"
 
 // PostgresStore wraps a pgxpool.Pool for database operations.
 type PostgresStore struct {
@@ -42,7 +46,7 @@ func (s *PostgresStore) Close() {
 // It returns true if the event was newly processed, or false if it was a duplicate.
 func (s *PostgresStore) ProcessTransaction(ctx context.Context, ev domain.TransactionEvent) (bool, error) {
 	if err := ev.Validate(); err != nil {
-		return false, fmt.Errorf("validate event: %w", err)
+		return false, err
 	}
 
 	points, err := domain.CalculatePoints(ev.EventType, ev.AmountCents)
@@ -63,7 +67,7 @@ func (s *PostgresStore) ProcessTransaction(ctx context.Context, ev domain.Transa
 		ON CONFLICT (idempotency_key) DO NOTHING
 	`, ev.IdempotencyKey, ev.CustomerID, ev.EventType, ev.AmountCents, points, ev.OccurredAt)
 	if err != nil {
-		return false, fmt.Errorf("insert processed_event: %w", err)
+		return false, classifyStoreError("insert processed_event", err)
 	}
 
 	if tag.RowsAffected() == 0 {
@@ -79,14 +83,14 @@ func (s *PostgresStore) ProcessTransaction(ctx context.Context, ev domain.Transa
 		    updated_at = NOW()
 		RETURNING balance
 	`, ev.CustomerID, points).Scan(&balanceAfter); err != nil {
-		return false, fmt.Errorf("upsert customer_balance: %w", err)
+		return false, classifyStoreError("upsert customer_balance", err)
 	}
 
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO reward_ledger (customer_id, idempotency_key, points_delta, balance_after)
 		VALUES ($1, $2, $3, $4)
 	`, ev.CustomerID, ev.IdempotencyKey, points, balanceAfter); err != nil {
-		return false, fmt.Errorf("insert reward_ledger: %w", err)
+		return false, classifyStoreError("insert reward_ledger", err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -94,4 +98,12 @@ func (s *PostgresStore) ProcessTransaction(ctx context.Context, ev domain.Transa
 	}
 
 	return true, nil
+}
+
+func classifyStoreError(op string, err error) error {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == pgCheckViolationCode {
+		return fmt.Errorf("%s: %w: %w", op, domain.ErrInsufficientBalance, pgErr)
+	}
+	return fmt.Errorf("%s: %w", op, err)
 }
