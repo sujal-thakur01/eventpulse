@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"time"
 
 	"github.com/segmentio/kafka-go"
@@ -16,9 +17,9 @@ const (
 	ReasonPoison           = "poison"
 	ReasonRetriesExhausted = "retries_exhausted"
 
-	defaultMaxAttempts = 3
+	defaultMaxAttempts = 6
 	defaultBaseBackoff = 100 * time.Millisecond
-	defaultMaxBackoff  = 2 * time.Second
+	defaultMaxBackoff  = 5 * time.Second
 )
 
 // MessageFetcher reads messages from Kafka and commits offsets explicitly.
@@ -57,6 +58,7 @@ type Config struct {
 	BaseBackoff time.Duration
 	MaxBackoff  time.Duration
 	Sleep       func(ctx context.Context, d time.Duration) error
+	Jitter      func(d time.Duration) time.Duration
 	Now         func() time.Time
 }
 
@@ -72,6 +74,9 @@ func (c Config) withDefaults() Config {
 	}
 	if c.Sleep == nil {
 		c.Sleep = sleepWithContext
+	}
+	if c.Jitter == nil {
+		c.Jitter = equalJitter
 	}
 	if c.Now == nil {
 		c.Now = time.Now
@@ -103,6 +108,7 @@ func NewWorker(fetcher MessageFetcher, store EventStore, dlq DLQWriter, logger *
 }
 
 // Run continuously fetches, processes, and commits messages until ctx is canceled.
+// It never fetches the next message while the current message is unresolved.
 func (w *Worker) Run(ctx context.Context) error {
 	for {
 		msg, err := w.fetcher.FetchMessage(ctx)
@@ -113,16 +119,24 @@ func (w *Worker) Run(ctx context.Context) error {
 			return fmt.Errorf("fetch message: %w", err)
 		}
 
-		if err := w.handleMessage(ctx, msg); err != nil {
+		for attempt := 1; ; attempt++ {
+			err := w.handleMessage(ctx, msg)
+			if err == nil {
+				break
+			}
 			if ctx.Err() != nil {
 				return nil
 			}
-			w.logger.Error("message handling failed without commit",
+			w.logger.Error("message handling failed without commit; retrying same message",
 				"topic", msg.Topic,
 				"partition", msg.Partition,
 				"offset", msg.Offset,
+				"attempt", attempt,
 				"error", err,
 			)
+			if sleepErr := w.cfg.Sleep(ctx, w.backoffDuration(attempt)); sleepErr != nil {
+				return nil
+			}
 		}
 	}
 }
@@ -131,11 +145,7 @@ func (w *Worker) handleMessage(ctx context.Context, msg kafka.Message) error {
 	var ev domain.TransactionEvent
 	if err := json.Unmarshal(msg.Value, &ev); err != nil {
 		decodeErr := fmt.Errorf("%w: %w", ErrDecode, err)
-		if isPoison(decodeErr) {
-			return w.sendToDLQAndCommit(ctx, msg, ReasonPoison, decodeErr, 1)
-		}
-		// Only reachable if classification is mutated; fall through to retry/DLQ below.
-		return w.retryDecodeFailure(ctx, msg, decodeErr)
+		return w.sendToDLQAndCommit(ctx, msg, ReasonPoison, decodeErr, 1)
 	}
 
 	var lastErr error
@@ -163,15 +173,6 @@ func (w *Worker) handleMessage(ctx context.Context, msg kafka.Message) error {
 	return w.sendToDLQAndCommit(ctx, msg, ReasonRetriesExhausted, lastErr, w.cfg.MaxAttempts)
 }
 
-func (w *Worker) retryDecodeFailure(ctx context.Context, msg kafka.Message, decodeErr error) error {
-	for attempt := 1; attempt < w.cfg.MaxAttempts; attempt++ {
-		if sleepErr := w.cfg.Sleep(ctx, w.backoffDuration(attempt)); sleepErr != nil {
-			return fmt.Errorf("retry backoff canceled: %w", sleepErr)
-		}
-	}
-	return w.sendToDLQAndCommit(ctx, msg, ReasonRetriesExhausted, decodeErr, w.cfg.MaxAttempts)
-}
-
 func (w *Worker) sendToDLQAndCommit(ctx context.Context, msg kafka.Message, reason string, cause error, attempts int) error {
 	record := DLQRecord{
 		OriginalTopic: msg.Topic,
@@ -196,17 +197,29 @@ func (w *Worker) sendToDLQAndCommit(ctx context.Context, msg kafka.Message, reas
 }
 
 func (w *Worker) backoffDuration(attempt int) time.Duration {
+	var d time.Duration
 	if attempt <= 1 {
-		return min(w.cfg.BaseBackoff, w.cfg.MaxBackoff)
-	}
-	d := w.cfg.BaseBackoff
-	for i := 1; i < attempt; i++ {
-		if d >= w.cfg.MaxBackoff/2 {
-			return w.cfg.MaxBackoff
+		d = min(w.cfg.BaseBackoff, w.cfg.MaxBackoff)
+	} else {
+		d = w.cfg.BaseBackoff
+		for i := 1; i < attempt; i++ {
+			if d >= w.cfg.MaxBackoff/2 {
+				d = w.cfg.MaxBackoff
+				break
+			}
+			d *= 2
 		}
-		d *= 2
+		d = min(d, w.cfg.MaxBackoff)
 	}
-	return min(d, w.cfg.MaxBackoff)
+	return w.cfg.Jitter(d)
+}
+
+func equalJitter(d time.Duration) time.Duration {
+	if d <= 1 {
+		return d
+	}
+	half := d / 2
+	return half + rand.N(d-half+1)
 }
 
 func sleepWithContext(ctx context.Context, d time.Duration) error {

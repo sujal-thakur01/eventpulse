@@ -190,6 +190,9 @@ func TestWorkerHandleMessage(t *testing.T) {
 					backoffs = append(backoffs, d)
 					return nil
 				},
+				Jitter: func(d time.Duration) time.Duration {
+					return d
+				},
 				Now: func() time.Time {
 					return time.Date(2026, 11, 27, 1, 30, 0, 0, time.UTC)
 				},
@@ -229,5 +232,136 @@ func TestWorkerHandleMessage(t *testing.T) {
 
 			require.Equal(t, tc.wantBackoffs, backoffs)
 		})
+	}
+}
+
+type runFetcher struct {
+	msgs       []kafka.Message
+	idx        int
+	committed  []kafka.Message
+	events     *[]string
+	cancelFunc context.CancelFunc
+}
+
+func (f *runFetcher) FetchMessage(ctx context.Context) (kafka.Message, error) {
+	if f.idx >= len(f.msgs) {
+		f.cancelFunc()
+		return kafka.Message{}, context.Canceled
+	}
+	msg := f.msgs[f.idx]
+	f.idx++
+	*f.events = append(*f.events, fmt.Sprintf("fetch:%d", msg.Offset))
+	return msg, nil
+}
+
+func (f *runFetcher) CommitMessages(_ context.Context, msgs ...kafka.Message) error {
+	for _, m := range msgs {
+		*f.events = append(*f.events, fmt.Sprintf("commit:%d", m.Offset))
+	}
+	f.committed = append(f.committed, msgs...)
+	return nil
+}
+
+type flakyDLQ struct {
+	failuresRemaining int
+	err               error
+	records           []DLQRecord
+	events            *[]string
+}
+
+func (d *flakyDLQ) PublishDLQ(_ context.Context, _ []byte, record DLQRecord) error {
+	if d.failuresRemaining > 0 {
+		d.failuresRemaining--
+		*d.events = append(*d.events, fmt.Sprintf("dlq_fail:%d", record.Offset))
+		return d.err
+	}
+	*d.events = append(*d.events, fmt.Sprintf("dlq_ok:%d", record.Offset))
+	d.records = append(d.records, record)
+	return nil
+}
+
+func TestWorkerRunRetriesSameMessageUntilCommitted(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var events []string
+	msg1 := kafka.Message{
+		Topic:     "transactions",
+		Partition: 0,
+		Offset:    10,
+		Key:       []byte("cust-1"),
+		Value:     []byte("{not-json"),
+	}
+	msg2 := kafka.Message{
+		Topic:     "transactions",
+		Partition: 0,
+		Offset:    11,
+		Key:       []byte("cust-2"),
+		Value:     validEventJSON(t),
+	}
+
+	fetcher := &runFetcher{
+		msgs:       []kafka.Message{msg1, msg2},
+		events:     &events,
+		cancelFunc: cancel,
+	}
+	st := &fakeStore{
+		fn: func(_ int, _ domain.TransactionEvent) (bool, error) {
+			events = append(events, "store_ok")
+			return true, nil
+		},
+	}
+	dlq := &flakyDLQ{
+		failuresRemaining: 2,
+		err:               errors.New("dlq broker down"),
+		events:            &events,
+	}
+
+	var backoffs []time.Duration
+	cfg := Config{
+		BaseBackoff: 10 * time.Millisecond,
+		MaxBackoff:  50 * time.Millisecond,
+		Sleep: func(_ context.Context, d time.Duration) error {
+			backoffs = append(backoffs, d)
+			return nil
+		},
+		Jitter: func(d time.Duration) time.Duration {
+			return d
+		},
+	}
+
+	w := NewWorker(fetcher, st, dlq, slog.New(slog.NewTextHandler(io.Discard, nil)), cfg)
+	err := w.Run(ctx)
+	require.NoError(t, err)
+
+	// msg1 must be fetched once, fail DLQ twice, succeed DLQ on 3rd try, and be committed
+	// BEFORE msg2 is ever fetched.
+	require.Equal(t, []string{
+		"fetch:10",
+		"dlq_fail:10",
+		"dlq_fail:10",
+		"dlq_ok:10",
+		"commit:10",
+		"fetch:11",
+		"store_ok",
+		"commit:11",
+	}, events)
+
+	require.Len(t, fetcher.committed, 2)
+	require.Equal(t, int64(10), fetcher.committed[0].Offset)
+	require.Equal(t, int64(11), fetcher.committed[1].Offset)
+	require.Len(t, dlq.records, 1)
+	require.Equal(t, []time.Duration{10 * time.Millisecond, 20 * time.Millisecond}, backoffs)
+}
+
+func TestWorkerDefaultsAndJitter(t *testing.T) {
+	w := NewWorker(&fakeFetcher{}, &fakeStore{}, &fakeDLQ{}, nil, Config{})
+	require.Equal(t, 6, w.cfg.MaxAttempts)
+	require.Equal(t, 5*time.Second, w.cfg.MaxBackoff)
+
+	for attempt := 1; attempt <= 6; attempt++ {
+		d := w.backoffDuration(attempt)
+		require.Greater(t, d, time.Duration(0))
+		require.LessOrEqual(t, d, 5*time.Second)
 	}
 }
