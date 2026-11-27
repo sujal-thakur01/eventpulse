@@ -9,8 +9,8 @@ Go service that ingests customer transaction events over HTTP, partitions them i
 | Guarantee | How it works | Proof test |
 | --- | --- | --- |
 | Per customer ordering | Producer uses `Murmur2Balancer` keyed by `customer_id` with `RequireAll`; worker resolves one message before fetching the next | `internal/queue/producer_integration_test.go` (`TestProducerGuarantee1Integration`), `internal/consumer/worker_test.go` (`TestWorkerRunRetriesSameMessageUntilCommitted`) |
-| At least once delivery | `CommitInterval` is `0` so offsets commit only after DB commit or DLQ publish; `processed_events` ignores duplicate `idempotency_key` inserts | `internal/store/postgres_integration_test.go` (`TestProcessTransactionIntegration`), `internal/consumer/worker_test.go` (`TestWorkerRunRetriesSameMessageUntilCommitted`) |
-| Atomic reward updates | `ProcessTransaction` inserts the event, upserts the balance, and writes the ledger in one PostgreSQL transaction | `internal/store/postgres_integration_test.go` (`TestProcessTransactionIntegration`) |
+| At least once delivery | `CommitInterval` is `0` so offsets commit only after DB commit or DLQ publish; `processed_events` ignores duplicate `idempotency_key` inserts | `internal/store/postgres_integration_test.go` (`TestProcessTransactionIntegration/same_event_twice_returns_false_on_duplicate_without_changing_balance_or_ledger`), `internal/consumer/worker_test.go` (`TestWorkerRunRetriesSameMessageUntilCommitted`) |
+| Atomic reward updates | `ProcessTransaction` inserts the event, upserts the balance, and writes the ledger in one PostgreSQL transaction | `internal/store/postgres_integration_test.go` (`TestProcessTransactionIntegration/guarantee3_ledger_failure_rolls_back_balance_and_event`) |
 | Dead letter separation | Poison errors go straight to `transactions.dlq`; transient errors retry up to 6 times with backoff before DLQ | `internal/consumer/worker_test.go` (`TestWorkerHandleMessage`) |
 
 ## Event Flow
@@ -68,8 +68,8 @@ flowchart TD
 
 ```mermaid
 erDiagram
-    customer_balances ||--o{ processed_events : customer_id
-    customer_balances ||--o{ reward_ledger : customer_id
+    customer_balances ||--o{ processed_events : "customer_id (logical)"
+    customer_balances ||--o{ reward_ledger : "customer_id (logical)"
     processed_events ||--|| reward_ledger : idempotency_key
     processed_events {
         bigint id PK
