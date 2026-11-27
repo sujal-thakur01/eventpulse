@@ -5,11 +5,11 @@ pipeline {
         stage('Lint') {
             agent {
                 docker {
-                    image 'golang:1.27'
+                    image 'golangci/golangci-lint:v2.15.0'
                 }
             }
             steps {
-                sh 'golangci-lint run'
+                sh 'golangci-lint run --build-tags=integration'
             }
         }
 
@@ -20,15 +20,23 @@ pipeline {
                     args '-v /var/run/docker.sock:/var/run/docker.sock'
                 }
             }
+            environment {
+                GOCACHE = '/tmp/.cache'
+                GOPATH  = '/tmp/go'
+            }
             options {
                 timeout(time: 15, unit: 'MINUTES')
             }
             steps {
-                sh '''
+                sh '''#!/bin/bash
                     set -o pipefail
-                    go test ./... 2>&1 | tee test-output.txt
-                    go test -tags=integration -race ./... 2>&1 | tee -a test-output.txt
+                    go test -tags=integration -race -timeout 12m ./... 2>&1 | tee test-output.txt
                 '''
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'test-output.txt', allowEmptyArchive: true
+                }
             }
         }
 
@@ -37,12 +45,6 @@ pipeline {
             steps {
                 sh "docker build -t eventpulse:${env.BUILD_NUMBER} ."
             }
-        }
-    }
-
-    post {
-        always {
-            archiveArtifacts artifacts: 'test-output.txt', allowEmptyArchive: true
         }
     }
 }

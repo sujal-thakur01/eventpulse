@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -27,22 +28,30 @@ type eventPublisher interface {
 }
 
 func main() {
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	cfg := config.Load()
-
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	if err := run(ctx); err != nil {
+		slog.New(slog.NewJSONHandler(os.Stdout, nil)).Error("eventpulse exited with error", "error", err)
+		os.Exit(1)
+	}
+}
+
+func run(ctx context.Context) error {
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	cfg := config.Load()
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	db, err := store.NewPostgresStore(ctx, cfg.DatabaseURL)
 	if err != nil {
-		logger.Error("failed to connect to postgres", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("connect to postgres: %w", err)
 	}
 	defer db.Close()
 
 	if err := db.Migrate(ctx); err != nil {
-		logger.Error("failed to apply migrations", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("apply migrations: %w", err)
 	}
 	logger.Info("database migrations applied")
 
@@ -96,30 +105,35 @@ func main() {
 
 	select {
 	case <-ctx.Done():
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutdownCancel()
 		if err := srv.Shutdown(shutdownCtx); err != nil {
 			logger.Error("http server shutdown error", "error", err)
 		}
 		if err := <-workerErrCh; err != nil {
-			logger.Error("consumer worker error", "error", err)
+			return fmt.Errorf("consumer worker error: %w", err)
 		}
+		return nil
 	case err := <-errCh:
 		if err != nil {
-			logger.Error("http server error", "error", err)
-			stop()
-			<-workerErrCh
-			os.Exit(1)
+			cancel()
+			if wErr := <-workerErrCh; wErr != nil {
+				return errors.Join(fmt.Errorf("http server error: %w", err), fmt.Errorf("consumer worker error: %w", wErr))
+			}
+			return fmt.Errorf("http server error: %w", err)
 		}
+		return nil
 	case err := <-workerErrCh:
 		if err != nil {
-			logger.Error("consumer worker error", "error", err)
-			stop()
-			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			_ = srv.Shutdown(shutdownCtx)
-			os.Exit(1)
+			cancel()
+			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer shutdownCancel()
+			if sErr := srv.Shutdown(shutdownCtx); sErr != nil {
+				logger.Error("http server shutdown error", "error", sErr)
+			}
+			return fmt.Errorf("consumer worker error: %w", err)
 		}
+		return nil
 	}
 }
 
