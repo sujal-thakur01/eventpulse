@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-EVENTS="${EVENTS:-30000}"
+EVENTS="${EVENTS:-60000}"
 RATE="${RATE:-1000}"
 CONCURRENCY="${CONCURRENCY:-100}"
 CUSTOMERS="${CUSTOMERS:-100}"
@@ -56,16 +56,20 @@ echo "Starting load generator (events=$EVENTS, rate=$RATE/s, concurrency=$CONCUR
   -expected-out "$EXPECTED_JSON" >"$LOADGEN_LOG" 2>&1 &
 LOADGEN_PID=$!
 
-sleep 10
-if ! kill -0 "$LOADGEN_PID" 2>/dev/null; then
-  echo "Load generator finished or exited before 10s kill" >&2
-  cat "$LOADGEN_LOG"
-  echo "FAIL"
-  exit 1
-fi
+mid_count=0
+while (( mid_count < 5000 )); do
+  if ! kill -0 "$LOADGEN_PID" 2>/dev/null; then
+    echo "Load generator finished or exited before processed_events reached 5000 (processed_events=$mid_count)" >&2
+    cat "$LOADGEN_LOG"
+    echo "FAIL"
+    exit 1
+  fi
+  sleep 1
+  mid_count="$(psql_query "SELECT COUNT(*) FROM processed_events;" | tr -d '[:space:]')"
+  mid_count="${mid_count:-0}"
+done
 
-mid_count="$(psql_query "SELECT COUNT(*) FROM processed_events;" | tr -d '[:space:]')"
-echo "Killing eventpulse container 10s in (processed_events=$mid_count/$EVENTS)..."
+echo "Killing eventpulse container mid-run (processed_events=$mid_count/$EVENTS)..."
 docker compose kill eventpulse
 
 sleep 2
