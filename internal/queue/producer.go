@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/segmentio/kafka-go"
 	"github.com/sujal-thakur01/eventpulse/internal/domain"
@@ -22,6 +23,7 @@ func NewProducer(brokers []string, topic string) *Producer {
 			Topic:        topic,
 			Balancer:     &kafka.Murmur2Balancer{},
 			RequiredAcks: kafka.RequireAll,
+			BatchTimeout: 10 * time.Millisecond,
 		},
 	}
 }

@@ -46,14 +46,17 @@ func createTopicAndWait(t *testing.T, ctx context.Context, broker, topic string,
 }
 
 func TestProducerGuarantee1Integration(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
+	startCtx, startCancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer startCancel()
 
-	ctr, err := kafkacontainer.Run(ctx, "confluentinc/confluent-local:7.5.0")
+	ctr, err := kafkacontainer.Run(startCtx, "confluentinc/confluent-local:7.5.0")
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		_ = ctr.Terminate(context.Background())
 	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
 
 	brokers, err := ctr.Brokers(ctx)
 	require.NoError(t, err)
