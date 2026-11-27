@@ -11,7 +11,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/segmentio/kafka-go"
 	"github.com/sujal-thakur01/eventpulse/internal/config"
+	"github.com/sujal-thakur01/eventpulse/internal/consumer"
 	"github.com/sujal-thakur01/eventpulse/internal/domain"
 	"github.com/sujal-thakur01/eventpulse/internal/queue"
 	"github.com/sujal-thakur01/eventpulse/internal/store"
@@ -48,6 +50,32 @@ func main() {
 		}
 	}()
 
+	dlqWriter := queue.NewDLQWriter(cfg.KafkaBrokers, cfg.KafkaDLQ)
+	defer func() {
+		if err := dlqWriter.Close(); err != nil {
+			logger.Error("failed to close kafka dlq writer", "error", err)
+		}
+	}()
+
+	reader := kafka.NewReader(kafka.ReaderConfig{
+		Brokers:        cfg.KafkaBrokers,
+		GroupID:        cfg.KafkaGroup,
+		Topic:          cfg.KafkaTopic,
+		CommitInterval: 0,
+	})
+	defer func() {
+		if err := reader.Close(); err != nil {
+			logger.Error("failed to close kafka reader", "error", err)
+		}
+	}()
+
+	worker := consumer.NewWorker(reader, db, dlqWriter, logger, consumer.Config{})
+	workerErrCh := make(chan error, 1)
+	go func() {
+		logger.Info("consumer worker started", "topic", cfg.KafkaTopic, "group", cfg.KafkaGroup)
+		workerErrCh <- worker.Run(ctx)
+	}()
+
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
 		Handler:           newMux(producer, logger),
@@ -67,10 +95,26 @@ func main() {
 	case <-ctx.Done():
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_ = srv.Shutdown(shutdownCtx)
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			logger.Error("http server shutdown error", "error", err)
+		}
+		if err := <-workerErrCh; err != nil {
+			logger.Error("consumer worker error", "error", err)
+		}
 	case err := <-errCh:
 		if err != nil {
 			logger.Error("http server error", "error", err)
+			stop()
+			<-workerErrCh
+			os.Exit(1)
+		}
+	case err := <-workerErrCh:
+		if err != nil {
+			logger.Error("consumer worker error", "error", err)
+			stop()
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = srv.Shutdown(shutdownCtx)
 			os.Exit(1)
 		}
 	}
