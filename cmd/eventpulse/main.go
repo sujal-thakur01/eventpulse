@@ -11,7 +11,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/99designs/gqlgen/graphql/handler"
+	"github.com/99designs/gqlgen/graphql/playground"
 	"github.com/segmentio/kafka-go"
+	"github.com/sujal-thakur01/eventpulse/graph"
 	"github.com/sujal-thakur01/eventpulse/internal/config"
 	"github.com/sujal-thakur01/eventpulse/internal/consumer"
 	"github.com/sujal-thakur01/eventpulse/internal/domain"
@@ -78,7 +81,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           newMux(producer, logger),
+		Handler:           newMux(producer, db, logger),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
@@ -120,7 +123,7 @@ func main() {
 	}
 }
 
-func newMux(pub eventPublisher, logger *slog.Logger) *http.ServeMux {
+func newMux(pub eventPublisher, st graph.Store, logger *slog.Logger) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -144,5 +147,12 @@ func newMux(pub eventPublisher, logger *slog.Logger) *http.ServeMux {
 		}
 		w.WriteHeader(http.StatusAccepted)
 	})
+
+	gqlSrv := handler.NewDefaultServer(graph.NewExecutableSchema(graph.Config{
+		Resolvers: &graph.Resolver{Store: st},
+	}))
+	mux.Handle("POST /graphql", gqlSrv)
+	mux.Handle("GET /playground", playground.Handler("EventPulse GraphQL", "/graphql"))
+
 	return mux
 }

@@ -33,7 +33,7 @@ func TestPostEventsHandler(t *testing.T) {
 
 	t.Run("valid event returns 202 and publishes", func(t *testing.T) {
 		pub := &stubPublisher{}
-		mux := newMux(pub, logger)
+		mux := newMux(pub, nil, logger)
 
 		body := `{"idempotency_key":"` + uuid.NewString() + `","customer_id":"cust-1","event_type":"purchase","amount_cents":1500,"occurred_at":"2026-11-27T01:00:00Z"}`
 		req := httptest.NewRequest(http.MethodPost, "/events", bytes.NewBufferString(body))
@@ -49,7 +49,7 @@ func TestPostEventsHandler(t *testing.T) {
 
 	t.Run("invalid json returns 400", func(t *testing.T) {
 		pub := &stubPublisher{}
-		mux := newMux(pub, logger)
+		mux := newMux(pub, nil, logger)
 
 		req := httptest.NewRequest(http.MethodPost, "/events", bytes.NewBufferString("{bad-json"))
 		rec := httptest.NewRecorder()
@@ -62,7 +62,7 @@ func TestPostEventsHandler(t *testing.T) {
 
 	t.Run("validation failure returns 400", func(t *testing.T) {
 		pub := &stubPublisher{}
-		mux := newMux(pub, logger)
+		mux := newMux(pub, nil, logger)
 
 		body := `{"idempotency_key":"not-a-uuid","customer_id":"cust-1","event_type":"purchase","amount_cents":1500,"occurred_at":"2026-11-27T01:00:00Z"}`
 		req := httptest.NewRequest(http.MethodPost, "/events", bytes.NewBufferString(body))
@@ -76,7 +76,7 @@ func TestPostEventsHandler(t *testing.T) {
 
 	t.Run("publish failure returns 500", func(t *testing.T) {
 		pub := &stubPublisher{err: errors.New("kafka unavailable")}
-		mux := newMux(pub, logger)
+		mux := newMux(pub, nil, logger)
 
 		body := `{"idempotency_key":"` + uuid.NewString() + `","customer_id":"cust-1","event_type":"purchase","amount_cents":1500,"occurred_at":"2026-11-27T01:00:00Z"}`
 		req := httptest.NewRequest(http.MethodPost, "/events", bytes.NewBufferString(body))
