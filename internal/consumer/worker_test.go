@@ -1,6 +1,7 @@
 package consumer
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -145,18 +146,16 @@ func TestWorkerHandleMessage(t *testing.T) {
 			wantBackoffs:   []time.Duration{10 * time.Millisecond, 20 * time.Millisecond},
 		},
 		{
-			name:    "transient never succeeds and goes to DLQ after max attempts",
+			name:    "transient never succeeds returns error without DLQ or commit after max attempts",
 			payload: validEventJSON,
 			storeFn: func(_ int, _ domain.TransactionEvent) (bool, error) {
 				return false, errTransient
 			},
-			wantErr:         false,
-			wantStoreCalls:  maxAttempts,
-			wantDLQCount:    1,
-			wantDLQReason:   ReasonRetriesExhausted,
-			wantDLQAttempts: maxAttempts,
-			wantCommitted:   true,
-			wantBackoffs:    []time.Duration{10 * time.Millisecond, 20 * time.Millisecond},
+			wantErr:        true,
+			wantStoreCalls: maxAttempts,
+			wantDLQCount:   0,
+			wantCommitted:  false,
+			wantBackoffs:   []time.Duration{10 * time.Millisecond, 20 * time.Millisecond},
 		},
 		{
 			name:    "failed DLQ publish means no commit",
@@ -364,4 +363,110 @@ func TestWorkerDefaultsAndJitter(t *testing.T) {
 		require.Greater(t, d, time.Duration(0))
 		require.LessOrEqual(t, d, 5*time.Second)
 	}
+}
+
+func TestWorkerTransientErrorNeverReachesDLQ(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var events []string
+	msg1 := kafka.Message{
+		Topic:     "transactions",
+		Partition: 0,
+		Offset:    20,
+		Key:       []byte("cust-1"),
+		Value:     validEventJSON(t),
+	}
+	msg2 := kafka.Message{
+		Topic:     "transactions",
+		Partition: 0,
+		Offset:    21,
+		Key:       []byte("cust-2"),
+		Value:     validEventJSON(t),
+	}
+
+	fetcher := &runFetcher{
+		msgs:       []kafka.Message{msg1, msg2},
+		events:     &events,
+		cancelFunc: cancel,
+	}
+
+	errTransient := errors.New("postgres unavailable")
+	const maxAttempts = 3
+	const transientFailures = 7 // Spans multiple handleMessage cycles in Run (> maxAttempts).
+
+	st := &fakeStore{
+		fn: func(attempt int, _ domain.TransactionEvent) (bool, error) {
+			if attempt <= transientFailures {
+				events = append(events, fmt.Sprintf("store_err:%d", attempt))
+				return false, errTransient
+			}
+			events = append(events, fmt.Sprintf("store_ok:%d", attempt))
+			return true, nil
+		},
+	}
+	dlq := &fakeDLQ{}
+
+	cfg := Config{
+		MaxAttempts: maxAttempts,
+		BaseBackoff: 5 * time.Millisecond,
+		MaxBackoff:  20 * time.Millisecond,
+		Sleep: func(_ context.Context, _ time.Duration) error {
+			return nil
+		},
+		Jitter: func(d time.Duration) time.Duration {
+			return d
+		},
+	}
+
+	w := NewWorker(fetcher, st, dlq, slog.New(slog.NewTextHandler(io.Discard, nil)), cfg)
+	err := w.Run(ctx)
+	require.NoError(t, err)
+
+	// Transient store errors must never be sent to the DLQ, even after exceeding MaxAttempts.
+	require.Empty(t, dlq.records)
+	require.Equal(t, []string{
+		"fetch:20",
+		"store_err:1",
+		"store_err:2",
+		"store_err:3",
+		"store_err:4",
+		"store_err:5",
+		"store_err:6",
+		"store_err:7",
+		"store_ok:8",
+		"commit:20",
+		"fetch:21",
+		"store_ok:9",
+		"commit:21",
+	}, events)
+	require.Len(t, fetcher.committed, 2)
+}
+
+func TestWorkerLogsDuplicateSkipped(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, nil))
+
+	fetcher := &fakeFetcher{}
+	st := &fakeStore{
+		fn: func(_ int, _ domain.TransactionEvent) (bool, error) {
+			return false, nil
+		},
+	}
+	dlq := &fakeDLQ{}
+
+	w := NewWorker(fetcher, st, dlq, logger, Config{})
+	msg := kafka.Message{
+		Topic:     "transactions",
+		Partition: 2,
+		Offset:    99,
+		Key:       []byte("cust-1"),
+		Value:     validEventJSON(t),
+	}
+
+	err := w.handleMessage(context.Background(), msg)
+	require.NoError(t, err)
+	require.Contains(t, logBuf.String(), `"msg":"duplicate_skipped"`)
+	require.Empty(t, dlq.records)
+	require.Len(t, fetcher.committed, 1)
 }

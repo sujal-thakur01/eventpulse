@@ -30,17 +30,22 @@ func main() {
 func run() error {
 	var (
 		n            = flag.Int("n", 1000, "number of unique valid events to send")
+		rate         = flag.Float64("rate", 0, "target events per second (0 for unlimited)")
 		concurrency  = flag.Int("concurrency", 20, "number of concurrent HTTP workers")
 		customers    = flag.Int("customers", 100, "number of distinct customers")
 		targetURL    = flag.String("url", "http://localhost:8080/events", "POST /events endpoint URL")
 		dsn          = flag.String("dsn", envOr("DATABASE_URL", "postgres://eventpulse:eventpulse@localhost:5432/eventpulse?sslmode=disable"), "PostgreSQL connection string")
 		pollInterval = flag.Duration("poll-interval", 50*time.Millisecond, "interval to poll processed_events row count")
 		timeout      = flag.Duration("timeout", 2*time.Minute, "timeout waiting for consumer to process all events")
+		expectedOut  = flag.String("expected-out", "", "optional path to write expected points per customer as JSON")
 	)
 	flag.Parse()
 
 	if *n <= 0 {
 		return fmt.Errorf("-n must be > 0, got %d", *n)
+	}
+	if *rate < 0 {
+		return fmt.Errorf("-rate must be >= 0, got %v", *rate)
 	}
 	if *concurrency <= 0 {
 		return fmt.Errorf("-concurrency must be > 0, got %d", *concurrency)
@@ -63,7 +68,7 @@ func run() error {
 		return fmt.Errorf("query initial processed_events count: %w", err)
 	}
 
-	payloads, err := buildPayloads(*n, *customers)
+	payloads, expectedPoints, err := buildPayloads(*n, *customers)
 	if err != nil {
 		return fmt.Errorf("build event payloads: %w", err)
 	}
@@ -77,10 +82,12 @@ func run() error {
 		},
 	}
 
+	limiter := newRateLimiter(*rate)
 	latencies := make([]time.Duration, *n)
 	var nextIdx atomic.Int64
 	var succeeded atomic.Int64
 	var failed atomic.Int64
+	var retries atomic.Int64
 
 	sendStart := time.Now()
 	var wg sync.WaitGroup
@@ -94,7 +101,14 @@ func run() error {
 				if idx >= *n {
 					return
 				}
-				lat, err := sendEvent(ctx, client, *targetURL, payloads[idx])
+				if err := limiter.Wait(ctx); err != nil {
+					failed.Add(1)
+					return
+				}
+				lat, attempts, err := sendEventWithRetry(ctx, client, *targetURL, payloads[idx])
+				if attempts > 1 {
+					retries.Add(int64(attempts - 1))
+				}
 				latencies[idx] = lat
 				if err != nil {
 					failed.Add(1)
@@ -116,6 +130,12 @@ func run() error {
 	}
 	totalElapsed := time.Since(sendStart)
 
+	if *expectedOut != "" {
+		if err := writeExpectedPoints(*expectedOut, expectedPoints); err != nil {
+			return fmt.Errorf("write expected points: %w", err)
+		}
+	}
+
 	slices.Sort(latencies)
 	p50 := percentile(latencies, 0.50)
 	p95 := percentile(latencies, 0.95)
@@ -124,8 +144,8 @@ func run() error {
 	httpRPS := float64(okCount) / sendElapsed.Seconds()
 	e2eRPS := float64(okCount) / totalElapsed.Seconds()
 
-	fmt.Printf("events_sent=%d succeeded=%d failed=%d concurrency=%d customers=%d\n",
-		*n, okCount, failCount, *concurrency, *customers)
+	fmt.Printf("events_sent=%d succeeded=%d failed=%d retries=%d rate=%.2f concurrency=%d customers=%d\n",
+		*n, okCount, failCount, retries.Load(), *rate, *concurrency, *customers)
 	fmt.Printf("processed_events_before=%d processed_events_after=%d\n",
 		initialCount, targetCount)
 	fmt.Printf("http_duration=%s http_events_per_sec=%.2f\n",
@@ -141,8 +161,56 @@ func run() error {
 	return nil
 }
 
-func buildPayloads(n, customers int) ([][]byte, error) {
+type rateLimiter struct {
+	interval time.Duration
+	mu       sync.Mutex
+	next     time.Time
+}
+
+func newRateLimiter(rps float64) *rateLimiter {
+	if rps <= 0 {
+		return nil
+	}
+	interval := time.Duration(float64(time.Second) / rps)
+	if interval <= 0 {
+		interval = time.Nanosecond
+	}
+	return &rateLimiter{
+		interval: interval,
+		next:     time.Now(),
+	}
+}
+
+func (l *rateLimiter) Wait(ctx context.Context) error {
+	if l == nil {
+		return nil
+	}
+	l.mu.Lock()
+	now := time.Now()
+	if l.next.Before(now.Add(-50 * time.Millisecond)) {
+		l.next = now
+	}
+	target := l.next
+	l.next = l.next.Add(l.interval)
+	l.mu.Unlock()
+
+	wait := time.Until(target)
+	if wait <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func buildPayloads(n, customers int) ([][]byte, map[string]int64, error) {
 	payloads := make([][]byte, n)
+	expectedPoints := make(map[string]int64, customers)
 	now := time.Now().UTC()
 	for i := range n {
 		ev := domain.TransactionEvent{
@@ -152,16 +220,55 @@ func buildPayloads(n, customers int) ([][]byte, error) {
 			AmountCents:    int64(100 + (i%100)*10),
 			OccurredAt:     now,
 		}
+		pts, err := domain.CalculatePoints(ev.EventType, ev.AmountCents)
+		if err != nil {
+			return nil, nil, err
+		}
+		expectedPoints[ev.CustomerID] += pts
+
 		b, err := json.Marshal(ev)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		payloads[i] = b
 	}
-	return payloads, nil
+	return payloads, expectedPoints, nil
 }
 
-func sendEvent(ctx context.Context, client *http.Client, targetURL string, payload []byte) (time.Duration, error) {
+func writeExpectedPoints(path string, expected map[string]int64) error {
+	data, err := json.MarshalIndent(expected, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	return os.WriteFile(path, data, 0o644)
+}
+
+func sendEventWithRetry(ctx context.Context, client *http.Client, targetURL string, payload []byte) (time.Duration, int, error) {
+	backoff := 50 * time.Millisecond
+	const maxBackoff = 500 * time.Millisecond
+
+	for attempt := 1; ; attempt++ {
+		lat, err := sendEventOnce(ctx, client, targetURL, payload)
+		if err == nil {
+			return lat, attempt, nil
+		}
+		if ctx.Err() != nil {
+			return lat, attempt, ctx.Err()
+		}
+
+		timer := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return lat, attempt, ctx.Err()
+		case <-timer.C:
+		}
+		backoff = min(backoff*2, maxBackoff)
+	}
+}
+
+func sendEventOnce(ctx context.Context, client *http.Client, targetURL string, payload []byte) (time.Duration, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(payload))
 	if err != nil {
 		return 0, err
@@ -177,7 +284,7 @@ func sendEvent(ctx context.Context, client *http.Client, targetURL string, paylo
 	_ = resp.Body.Close()
 	lat := time.Since(start)
 
-	if resp.StatusCode != http.StatusAccepted {
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return lat, fmt.Errorf("unexpected status %d", resp.StatusCode)
 	}
 	return lat, nil

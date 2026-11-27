@@ -4,7 +4,8 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-EVENTS="${EVENTS:-10000}"
+EVENTS="${EVENTS:-30000}"
+RATE="${RATE:-1000}"
 CONCURRENCY="${CONCURRENCY:-100}"
 CUSTOMERS="${CUSTOMERS:-100}"
 TIMEOUT="${TIMEOUT:-5m}"
@@ -26,8 +27,11 @@ wait_for_health() {
   return 1
 }
 
+echo "Rebuilding eventpulse image..."
+docker compose build eventpulse
+
 echo "Ensuring docker compose stack is running..."
-docker compose up -d
+docker compose up -d --force-recreate eventpulse
 wait_for_health
 
 echo "Resetting database tables..."
@@ -35,43 +39,38 @@ psql_query "TRUNCATE TABLE reward_ledger, processed_events, customer_balances RE
 
 LOADGEN_LOG="$(mktemp)"
 LOADGEN_BIN="$(mktemp)"
-trap 'rm -f "$LOADGEN_LOG" "$LOADGEN_BIN"' EXIT
+EXPECTED_JSON="$(mktemp)"
+trap 'rm -f "$LOADGEN_LOG" "$LOADGEN_BIN" "$EXPECTED_JSON"' EXIT
 
 echo "Building load generator..."
 go build -o "$LOADGEN_BIN" ./cmd/loadgen
 
-echo "Starting load generator (events=$EVENTS, concurrency=$CONCURRENCY, customers=$CUSTOMERS)..."
+TEST_START_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+echo "Starting load generator (events=$EVENTS, rate=$RATE/s, concurrency=$CONCURRENCY, customers=$CUSTOMERS)..."
 "$LOADGEN_BIN" \
   -n "$EVENTS" \
+  -rate "$RATE" \
   -concurrency "$CONCURRENCY" \
   -customers "$CUSTOMERS" \
-  -timeout "$TIMEOUT" >"$LOADGEN_LOG" 2>&1 &
+  -timeout "$TIMEOUT" \
+  -expected-out "$EXPECTED_JSON" >"$LOADGEN_LOG" 2>&1 &
 LOADGEN_PID=$!
 
-KILL_THRESHOLD=$((EVENTS / 2))
-killed=0
-for ((i = 1; i <= 300; i++)); do
-  if ! kill -0 "$LOADGEN_PID" 2>/dev/null; then
-    break
-  fi
-  count="$(psql_query "SELECT COUNT(*) FROM processed_events;" | tr -d '[:space:]')"
-  if [[ -n "$count" ]] && (( count >= KILL_THRESHOLD && count < EVENTS )); then
-    echo "Killing eventpulse container mid-run at processed_events=$count/$EVENTS..."
-    docker compose kill eventpulse
-    killed=1
-    break
-  fi
-  sleep 0.2
-done
-
-if (( killed == 0 )); then
-  echo "Warning: loadgen finished or did not reach threshold before kill; killing eventpulse now..."
-  docker compose kill eventpulse
+sleep 10
+if ! kill -0 "$LOADGEN_PID" 2>/dev/null; then
+  echo "Load generator finished or exited before 10s kill" >&2
+  cat "$LOADGEN_LOG"
+  echo "FAIL"
+  exit 1
 fi
 
-sleep 2
 mid_count="$(psql_query "SELECT COUNT(*) FROM processed_events;" | tr -d '[:space:]')"
-echo "Starting eventpulse container again (processed_events while down=$mid_count)..."
+echo "Killing eventpulse container 10s in (processed_events=$mid_count/$EVENTS)..."
+docker compose kill eventpulse
+
+sleep 2
+down_count="$(psql_query "SELECT COUNT(*) FROM processed_events;" | tr -d '[:space:]')"
+echo "Starting eventpulse container again after 2s (processed_events=$down_count)..."
 docker compose start eventpulse
 wait_for_health
 
@@ -87,25 +86,26 @@ if (( loadgen_status != 0 )); then
 fi
 
 processed_count="$(psql_query "SELECT COUNT(*) FROM processed_events;" | tr -d '[:space:]')"
-mismatch_count="$(psql_query "
-  SELECT COUNT(*) FROM (
-    SELECT
-      COALESCE(cb.customer_id, rl.customer_id) AS customer_id
-    FROM customer_balances cb
-    FULL OUTER JOIN (
-      SELECT customer_id, SUM(points_delta) AS ledger_sum
-      FROM reward_ledger
-      GROUP BY customer_id
-    ) rl ON cb.customer_id = rl.customer_id
-    WHERE COALESCE(cb.balance, -1) <> COALESCE(rl.ledger_sum, -1)
-       OR cb.customer_id IS NULL
-       OR rl.customer_id IS NULL
-  ) mismatches;
+ledger_count="$(psql_query "SELECT COUNT(*) FROM reward_ledger;" | tr -d '[:space:]')"
+expected_b64="$(base64 < "$EXPECTED_JSON" | tr -d '\n')"
+balance_mismatch_count="$(psql_query "
+  WITH expected AS (
+    SELECT key AS customer_id, value::bigint AS expected_points
+    FROM jsonb_each_text(convert_from(decode('$expected_b64', 'base64'), 'UTF8')::jsonb)
+  )
+  SELECT COUNT(*)
+  FROM expected e
+  FULL OUTER JOIN customer_balances cb ON cb.customer_id = e.customer_id
+  WHERE cb.customer_id IS NULL
+     OR e.customer_id IS NULL
+     OR cb.balance <> e.expected_points;
 " | tr -d '[:space:]')"
 
-echo "Verification: processed_events=$processed_count (expected $EVENTS), balance_mismatches=$mismatch_count"
+duplicate_skipped_count="$(docker compose logs --no-color --since "$TEST_START_TS" eventpulse | grep -c '"duplicate_skipped"' || true)"
 
-if [[ "$processed_count" == "$EVENTS" && "$mismatch_count" == "0" ]]; then
+echo "Verification: processed_events=$processed_count (expected $EVENTS), reward_ledger=$ledger_count (expected $EVENTS), balance_mismatches=$balance_mismatch_count, duplicate_skipped=$duplicate_skipped_count"
+
+if [[ "$processed_count" == "$EVENTS" && "$ledger_count" == "$EVENTS" && "$balance_mismatch_count" == "0" ]]; then
   echo "PASS"
   exit 0
 else

@@ -11,7 +11,7 @@ Go service that ingests customer transaction events over HTTP, partitions them i
 | Per customer ordering | Producer uses `Murmur2Balancer` keyed by `customer_id` with `RequireAll`; worker resolves one message before fetching the next | `internal/queue/producer_integration_test.go` (`TestProducerGuarantee1Integration`), `internal/consumer/worker_test.go` (`TestWorkerRunRetriesSameMessageUntilCommitted`) |
 | At least once delivery | `CommitInterval` is `0` so offsets commit only after DB commit or DLQ publish; `processed_events` ignores duplicate `idempotency_key` inserts | `internal/store/postgres_integration_test.go` (`TestProcessTransactionIntegration/same_event_twice_returns_false_on_duplicate_without_changing_balance_or_ledger`), `internal/consumer/worker_test.go` (`TestWorkerRunRetriesSameMessageUntilCommitted`) |
 | Atomic reward updates | `ProcessTransaction` inserts the event, upserts the balance, and writes the ledger in one PostgreSQL transaction | `internal/store/postgres_integration_test.go` (`TestProcessTransactionIntegration/guarantee3_ledger_failure_rolls_back_balance_and_event`) |
-| Dead letter separation | Poison errors go straight to `transactions.dlq`; transient errors retry up to 6 times with backoff before DLQ | `internal/consumer/worker_test.go` (`TestWorkerHandleMessage`) |
+| Dead letter separation | Poison errors go straight to `transactions.dlq`; transient errors never go to DLQ and retry with backoff until committed | `internal/consumer/worker_test.go` (`TestWorkerHandleMessage`, `TestWorkerTransientErrorNeverReachesDLQ`) |
 
 ## Event Flow
 
@@ -31,12 +31,11 @@ sequenceDiagram
         Worker->>DLQ: PublishDLQ (reason=poison)
         Worker->>Kafka: CommitMessages
     else Transient error
-        loop Up to 6 attempts with backoff and jitter
+        loop Retry up to 6 attempts per Run cycle without committing (never DLQ)
             Worker->>Postgres: ProcessTransaction
             Postgres-->>Worker: error
         end
-        Worker->>DLQ: PublishDLQ (reason=retries_exhausted)
-        Worker->>Kafka: CommitMessages
+        Worker->>Kafka: CommitMessages once Postgres succeeds
     else Success or duplicate
         Worker->>Postgres: ProcessTransaction (1 TX)
         Postgres-->>Worker: committed
@@ -57,9 +56,9 @@ flowchart TD
     Process -->|insufficient balance| Poison
     Process -->|transient error| Retry{Attempts < 6?}
     Retry -->|yes| Backoff["Sleep with backoff and jitter"] --> Process
-    Retry -->|no| Exhausted["Publish DLQ (retries_exhausted)"]
+    Retry -->|no| TransientNoCommit["Return error, no commit (never DLQ)"]
+    TransientNoCommit --> RunRetry["Run backs off and retries same message"] --> Process
     Poison --> DLQOk{DLQ publish ok?}
-    Exhausted --> DLQOk
     DLQOk -->|yes| Commit
     DLQOk -->|no| NoCommit["Return error, no commit"]
 ```
@@ -129,7 +128,7 @@ curl -s -X POST http://localhost:8080/graphql -H 'Content-Type: application/json
 
 | Decision | Why |
 | --- | --- |
-| Exhausted retries go to DLQ | Keeps the partition open for other customers instead of stalling forever on one failing event. |
+| Transient errors never go to DLQ | Retrying without committing preserves partition ordering and avoids losing valid events during transient DB outages. |
 | Negative balance refunds are poison | `CHECK (balance >= 0)` rejects them and retrying cannot pass without a later credit. |
 | UUID required for `idempotency_key` | Enforces a consistent unique format across producers and avoids accidental collisions. |
 | Server side points (`amount_cents / 100`) | Keeps point math consistent across `purchase`, `bonus`, and negative `refund` events. |

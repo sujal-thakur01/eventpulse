@@ -14,8 +14,7 @@ import (
 )
 
 const (
-	ReasonPoison           = "poison"
-	ReasonRetriesExhausted = "retries_exhausted"
+	ReasonPoison = "poison"
 
 	defaultMaxAttempts = 6
 	defaultBaseBackoff = 100 * time.Millisecond
@@ -150,8 +149,17 @@ func (w *Worker) handleMessage(ctx context.Context, msg kafka.Message) error {
 
 	var lastErr error
 	for attempt := 1; attempt <= w.cfg.MaxAttempts; attempt++ {
-		_, err := w.store.ProcessTransaction(ctx, ev)
+		created, err := w.store.ProcessTransaction(ctx, ev)
 		if err == nil {
+			if !created {
+				w.logger.Info("duplicate_skipped",
+					"topic", msg.Topic,
+					"partition", msg.Partition,
+					"offset", msg.Offset,
+					"customer_id", ev.CustomerID,
+					"idempotency_key", ev.IdempotencyKey,
+				)
+			}
 			if commitErr := w.fetcher.CommitMessages(ctx, msg); commitErr != nil {
 				return fmt.Errorf("commit offset: %w", commitErr)
 			}
@@ -170,7 +178,7 @@ func (w *Worker) handleMessage(ctx context.Context, msg kafka.Message) error {
 		}
 	}
 
-	return w.sendToDLQAndCommit(ctx, msg, ReasonRetriesExhausted, lastErr, w.cfg.MaxAttempts)
+	return fmt.Errorf("process transaction after %d attempts: %w", w.cfg.MaxAttempts, lastErr)
 }
 
 func (w *Worker) sendToDLQAndCommit(ctx context.Context, msg kafka.Message, reason string, cause error, attempts int) error {
