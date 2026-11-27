@@ -2,7 +2,7 @@
 
 Go service that ingests customer transaction events over HTTP, partitions them in Kafka, stores reward points atomically in PostgreSQL, and serves balances over GraphQL.
 
-![Go](https://img.shields.io/badge/Go-1.27-00ADD8?style=flat-square&logo=go&logoColor=white) ![Kafka](https://img.shields.io/badge/Kafka-3.9-231F20?style=flat-square&logo=apachekafka&logoColor=white) ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-4169E1?style=flat-square&logo=postgresql&logoColor=white) ![GraphQL](https://img.shields.io/badge/GraphQL-gqlgen-E10098?style=flat-square&logo=graphql&logoColor=white) ![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?style=flat-square&logo=docker&logoColor=white)
+[![CI](https://github.com/sujal-thakur01/eventpulse/actions/workflows/ci.yml/badge.svg)](https://github.com/sujal-thakur01/eventpulse/actions/workflows/ci.yml) ![Go](https://img.shields.io/badge/Go-1.27-00ADD8?style=flat-square&logo=go&logoColor=white) ![Kafka](https://img.shields.io/badge/Kafka-3.9-231F20?style=flat-square&logo=apachekafka&logoColor=white) ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-4169E1?style=flat-square&logo=postgresql&logoColor=white) ![GraphQL](https://img.shields.io/badge/GraphQL-gqlgen-E10098?style=flat-square&logo=graphql&logoColor=white) ![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?style=flat-square&logo=docker&logoColor=white)
 
 ## Guarantees
 
